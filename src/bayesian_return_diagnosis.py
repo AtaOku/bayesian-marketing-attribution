@@ -797,6 +797,10 @@ def flat_csv_rows_to_params(rows):
     params = {"priors": {}, "increments": {}, "outcome": {"strengths": {}}}
     warnings = []
 
+    # Skip header row if present (user may have added column headers in spreadsheet)
+    if rows and rows[0][0].lower() in ("section", "type", "category"):
+        rows = rows[1:]
+
     for section, param, value in rows:
         # Validate section
         if section not in ("priors", "increments", "outcome"):
@@ -878,6 +882,25 @@ def validate_params(params):
             for cause, val in params["outcome"]["strengths"].items():
                 if not _is_valid_probability(val):
                     errors.append(f"Strength '{cause}' = {val} — must be in [0, 1]")
+
+    # Cross-parameter validation: check that base + all increments < 0.95
+    # (prevents silent clamping that removes discriminative power)
+    if "increments" in params:
+        for cause, inc_dict in params["increments"].items():
+            # For bracketing, use the "with" keys for sum check
+            if cause == "bracketing":
+                max_sum = inc_dict.get("base_with_multi_size", 0)
+                for k, v in inc_dict.items():
+                    if k.endswith("_with") and k != "base_with_multi_size":
+                        max_sum += v
+            else:
+                max_sum = sum(v for v in inc_dict.values() if isinstance(v, (int, float)))
+            if max_sum > 0.95:
+                errors.append(
+                    f"Increments for '{cause}' sum to {max_sum:.3f} — "
+                    f"all CPT entries will be clamped to 0.95, losing discriminative power. "
+                    f"Reduce increments so the maximum sum stays below 0.95."
+                )
 
     return (len(errors) == 0, errors)
 

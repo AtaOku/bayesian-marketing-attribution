@@ -126,11 +126,13 @@ def get_segment_network(params_hash=None, custom_params=None):
 
 
 def _params_hash(params):
-    """Create a hashable key from params dict for cache invalidation."""
+    """Create a deterministic cache key from params dict for cache invalidation."""
     if params is None:
         return "default"
     import json
-    return hash(json.dumps(params, sort_keys=True))
+    import hashlib
+    serialized = json.dumps(params, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()[:16]
 
 
 # Initialize custom params in session state
@@ -138,7 +140,15 @@ if "custom_params" not in st.session_state:
     st.session_state.custom_params = None
 
 custom_params = st.session_state.custom_params
-bn = get_network(params_hash=_params_hash(custom_params), custom_params=custom_params)
+_cache_key = _params_hash(custom_params)
+
+# Check if network is already cached (warm) before showing spinner
+if f"_network_ready_{_cache_key}" not in st.session_state:
+    with st.spinner("Building Bayesian network (first load ~3s)..."):
+        bn = get_network(params_hash=_cache_key, custom_params=custom_params)
+    st.session_state[f"_network_ready_{_cache_key}"] = True
+else:
+    bn = get_network(params_hash=_cache_key, custom_params=custom_params)
 
 
 # =============================================================================
@@ -165,6 +175,57 @@ if st.session_state.get("custom_params") is not None:
         (default: {default_mr_ref:.1%}) · Go to <strong>Calibration</strong> tab to adjust or reset.
     </div>
     """, unsafe_allow_html=True)
+
+
+# =============================================================================
+# SCENARIO DEFINITIONS (static configuration — module level)
+# =============================================================================
+SCENARIO_INFO = {
+    "The Size-Blind First-Timer": {
+        "subtitle": "First-time buyer orders a dress on mobile without checking the size guide",
+        "signals": {"size_sensitive_category": "Yes", "is_first_purchase": "Yes",
+                    "mobile_purchase": "Yes", "viewed_size_guide": "No",
+                    "multi_size_order": "No"},
+        "expect": "Size/Fit Mismatch — high-risk category, no size guide, new customer",
+    },
+    "The Instagram Impulse Shopper": {
+        "subtitle": "Gen Z grabs a flash sale from a social media ad on their phone",
+        "signals": {"purchased_on_discount": "Yes", "social_media_referral": "Yes",
+                    "mobile_purchase": "Yes", "young_customer": "Yes",
+                    "is_first_purchase": "Yes", "multi_size_order": "No"},
+        "expect": "Impulse/Buyer's Regret — discount-driven, unplanned purchase",
+    },
+    "The Try-At-Home Bracketer": {
+        "subtitle": "Gen Z discovers brand via Instagram, orders 2 sizes of the same item",
+        "signals": {"is_first_purchase": "Yes", "young_customer": "Yes",
+                    "social_media_referral": "Yes", "mobile_purchase": "Yes",
+                    "multi_size_order": "Yes"},
+        "expect": "Bracketing — ordered two sizes to try at home",
+    },
+    "The Disappointed Premium Buyer": {
+        "subtitle": "New customer buys an expensive item on mobile — high expectations unmet",
+        "signals": {"premium_price": "Yes", "is_first_purchase": "Yes",
+                    "mobile_purchase": "Yes", "multi_size_order": "No"},
+        "expect": "Expectation Gap — premium price sets high quality bar",
+    },
+    "The Frustrated Late Receiver": {
+        "subtitle": "Multi-item premium order arrives late — frustration and quality concerns",
+        "signals": {"slow_delivery": "Yes", "premium_price": "Yes",
+                    "multiple_items_in_order": "Yes", "multi_size_order": "No"},
+        "expect": "Quality/Fulfillment — slow shipping + premium expectations",
+    },
+    "The Serial Returner": {
+        "subtitle": "Known high-return customer orders multiple sizes on discount",
+        "signals": {"high_return_history": "Yes", "young_customer": "Yes",
+                    "multi_size_order": "Yes", "purchased_on_discount": "Yes"},
+        "expect": "Bracketing — habitual bracket-and-return behavior",
+    },
+}
+
+scenario_names = list(SCENARIO_INFO.keys())
+
+# Build PRESETS dict from SCENARIO_INFO for backward compat
+PRESETS = {name: info["signals"] for name, info in SCENARIO_INFO.items()}
 
 
 # =============================================================================
@@ -207,60 +268,12 @@ with tab_diagnose:
 
     st.markdown("#### Select a scenario to diagnose why the order was returned")
 
-    # --- Scenario Selection (main area) ---
-    SCENARIO_INFO = {
-        "The Size-Blind First-Timer": {
-            "subtitle": "First-time buyer orders a dress on mobile without checking the size guide",
-            "signals": {"size_sensitive_category": "Yes", "is_first_purchase": "Yes",
-                        "mobile_purchase": "Yes", "viewed_size_guide": "No",
-                        "multi_size_order": "No"},
-            "expect": "Size/Fit Mismatch — high-risk category, no size guide, new customer",
-        },
-        "The Instagram Impulse Shopper": {
-            "subtitle": "Gen Z grabs a flash sale from a social media ad on their phone",
-            "signals": {"purchased_on_discount": "Yes", "social_media_referral": "Yes",
-                        "mobile_purchase": "Yes", "young_customer": "Yes",
-                        "is_first_purchase": "Yes", "multi_size_order": "No"},
-            "expect": "Impulse/Buyer's Regret — discount-driven, unplanned purchase",
-        },
-        "The Try-At-Home Bracketer": {
-            "subtitle": "Gen Z discovers brand via Instagram, orders 2 sizes of the same item",
-            "signals": {"is_first_purchase": "Yes", "young_customer": "Yes",
-                        "social_media_referral": "Yes", "mobile_purchase": "Yes",
-                        "multi_size_order": "Yes"},
-            "expect": "Bracketing — ordered two sizes to try at home",
-        },
-        "The Disappointed Premium Buyer": {
-            "subtitle": "New customer buys an expensive item on mobile — high expectations unmet",
-            "signals": {"premium_price": "Yes", "is_first_purchase": "Yes",
-                        "mobile_purchase": "Yes", "multi_size_order": "No"},
-            "expect": "Expectation Gap — premium price sets high quality bar",
-        },
-        "The Frustrated Late Receiver": {
-            "subtitle": "Multi-item premium order arrives late — frustration and quality concerns",
-            "signals": {"slow_delivery": "Yes", "premium_price": "Yes",
-                        "multiple_items_in_order": "Yes", "multi_size_order": "No"},
-            "expect": "Quality/Fulfillment — slow shipping + premium expectations",
-        },
-        "The Serial Returner": {
-            "subtitle": "Known high-return customer orders multiple sizes on discount",
-            "signals": {"high_return_history": "Yes", "young_customer": "Yes",
-                        "multi_size_order": "Yes", "purchased_on_discount": "Yes"},
-            "expect": "Bracketing — habitual bracket-and-return behavior",
-        },
-    }
-
-    scenario_names = list(SCENARIO_INFO.keys())
-
-    # Build PRESETS dict from SCENARIO_INFO for backward compat
-    PRESETS = {name: info["signals"] for name, info in SCENARIO_INFO.items()}
-
     # --- Horizontal button selector ---
     if "selected_scenario" not in st.session_state:
         st.session_state.selected_scenario = scenario_names[0]
 
-    ROW1 = scenario_names[:4]
-    ROW2 = scenario_names[4:]
+    ROW1 = scenario_names[:3]
+    ROW2 = scenario_names[3:]
 
     btn_cols1 = st.columns(len(ROW1))
     for i, (name, col) in enumerate(zip(ROW1, btn_cols1)):
@@ -277,7 +290,7 @@ with tab_diagnose:
         with col:
             is_active = st.session_state.selected_scenario == name
             short = name.replace("The ", "")
-            if st.button(short, key=f"sc_{i+4}", use_container_width=True,
+            if st.button(short, key=f"sc_{i+3}", use_container_width=True,
                          type="primary" if is_active else "secondary"):
                 st.session_state.selected_scenario = name
                 st.rerun()
@@ -326,7 +339,8 @@ with tab_diagnose:
                 value=False,
                 key="continuous_mode",
                 help="Enter exact values (discount %, age, price €, delivery days) "
-                     "instead of Yes/No. The model adjusts CPT weights based on intensity.",
+                     "instead of Yes/No. The model adjusts CPT weights via linear interpolation. "
+                     "Note: the BN structure stays binary — only CPT weights are modulated.",
             )
         else:
             continuous_mode = False
@@ -430,12 +444,14 @@ with tab_diagnose:
     results = diagnose_return(diagnosis_bn, evidence)
     inference_time = (time.time() - t0) * 1000
 
-    marginal_return = compute_marginal_return_rate(diagnosis_bn)
+    # Always show baseline from the unmodulated network (fixed reference)
+    # When continuous mode is active, diagnosis_bn may differ from bn
+    marginal_return = compute_marginal_return_rate(bn)
 
     # --- Posterior Entropy (imported from src) ---
     normalized_entropy = posterior_entropy(results)
 
-    # Confidence hesabı (aşağıda yeniden kullanılacak)
+    # Confidence calculation (reused below in cause card rendering)
     if len(results) >= 2 and results[1]["lift"] > 0:
         lift_ratio = results[0]["lift"] / results[1]["lift"]
         confidence_label = "High" if lift_ratio >= 3.0 else ("Medium" if lift_ratio >= 1.5 else "Low")
@@ -446,7 +462,8 @@ with tab_diagnose:
     col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
     with col_m1:
         st.metric("Baseline Return Rate", f"{marginal_return:.1%}",
-                   help="Average return rate across all orders — P(returned=Yes) with no signals observed")
+                   help="P(returned=Yes) with no signals observed — the platform's average return rate. "
+                        "Adjust in Calibration tab to match your platform.")
     with col_m2:
         st.metric("Evidence Signals", f"{len(active_evidence)} / {len(OBSERVABLE_NODES)}",
                    help="Signals set vs marginalized")
@@ -460,8 +477,18 @@ with tab_diagnose:
                         "High ≥ 3x, Medium ≥ 1.5x, Low < 1.5x. "
                         "(heuristic: lift ratio top cause / runner-up)")
     with col_m5:
-        st.metric("Posterior Entropy", f"{normalized_entropy:.0%} uncertainty",
-                   help="0% = one cause dominates completely. 100% = all causes equally likely. Complements Diagnostic Separation.")
+        if normalized_entropy < 0.33:
+            entropy_label = f"{normalized_entropy:.0%} — low"
+        elif normalized_entropy < 0.66:
+            entropy_label = f"{normalized_entropy:.0%} — medium"
+        else:
+            entropy_label = f"{normalized_entropy:.0%} — high"
+        st.metric("Posterior Entropy", entropy_label,
+                   help="How spread the probability is across all 5 root causes. "
+                        "Low (<33%) = one cause clearly dominates. "
+                        "Medium (33–66%) = 2–3 competing causes. "
+                        "High (>66%) = evidence is ambiguous. "
+                        "Complements Diagnostic Separation.")
 
     # Show continuous weight detail if active
     if continuous_values:
@@ -501,6 +528,9 @@ with tab_diagnose:
     # Determine if lift and posterior rankings disagree
     _highest_posterior_name = max(results, key=lambda x: x["posterior"])["name"] if results else None
 
+    # Normalize bars to max posterior so the top cause always fills 100%
+    _max_posterior = max(x["posterior"] for x in results) if results else 1.0
+
     for i, r in enumerate(results):
         is_top = (i == 0 and r["lift"] > 1.5 and len(active_evidence) > 0)
         is_highest_posterior = (r["name"] == _highest_posterior_name
@@ -514,7 +544,7 @@ with tab_diagnose:
             lift_class = "lift-low"
 
         card_class = "cause-card top-cause" if is_top else "cause-card"
-        bar_pct = min(r["posterior"] * 100, 100)
+        bar_pct = min((r["posterior"] / _max_posterior) * 100, 100) if _max_posterior > 0 else 0
         bar_color = "#e53e3e" if is_top else "#667eea"
 
         # Badge row: lift badge + optional "highest posterior" badge
@@ -541,6 +571,35 @@ with tab_diagnose:
             <div class="cause-citation">{r['citation']}</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # Show expected vs. actual for preset scenarios
+    if not is_custom and preset in SCENARIO_INFO and results:
+        expected_text = SCENARIO_INFO[preset]["expect"]
+        actual_top = results[0]["label"]
+        expected_cause_keywords = {
+            "size_mismatch": ["Size", "Fit"],
+            "expectation_gap": ["Expectation", "Gap"],
+            "impulse_regret": ["Impulse", "Regret"],
+            "bracketing": ["Bracket"],
+            "quality_or_damage": ["Quality", "Fulfillment"],
+        }
+        expected_key = None
+        for cause, keywords in expected_cause_keywords.items():
+            if any(kw.lower() in expected_text.lower() for kw in keywords):
+                expected_key = cause
+                break
+
+        if expected_key:
+            matches = results[0]["name"] == expected_key
+            badge = "As expected" if matches else "Unexpected result"
+            color = "#f0fff4" if matches else "#fffff0"
+            border = "#68d391" if matches else "#ecc94b"
+            st.markdown(f"""
+            <div style="background:{color}; border:1px solid {border}; border-radius:6px;
+                        padding:0.4rem 0.8rem; font-size:0.82rem; margin-top:0.5rem;">
+                {badge} · Expected: {expected_text}
+            </div>
+            """, unsafe_allow_html=True)
 
     # --- Customer Segment Inference (extended network) ---
     if active_evidence:
@@ -687,6 +746,11 @@ with tab_diagnose:
 # =============================================================================
 with tab_whatif:
     st.subheader("What-If Simulation: Test Interventions")
+    st.caption(
+        "**Observational conditioning** — shows correlation, not causation. "
+        "True causal intervention would require do-calculus (Pearl, 2009). "
+        "See the expander below for details."
+    )
     st.caption("Change one observable signal and observe the effect on return probability "
                "and root cause distribution.")
 
@@ -1202,6 +1266,12 @@ with tab_calibrate:
         uploaded = st.file_uploader("Upload parameter CSV", type=["csv"], key="csv_upload")
 
         if uploaded is not None:
+            # Guard against oversized uploads
+            if uploaded.size > 100_000:  # 100KB limit
+                st.error("CSV file too large (max 100KB). "
+                         "The parameter CSV should be under 2KB — "
+                         "if yours is larger, it may contain extra data.")
+                st.stop()
             # File size guard (max 1MB)
             if uploaded.size > 1_000_000:
                 st.error("File too large. Maximum size is 1MB.")
