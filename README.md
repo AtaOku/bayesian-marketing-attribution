@@ -26,15 +26,19 @@ Customer-reported reasons are unreliable: surveys show only 30-40% completion, a
 
 ## The Solution: Backward Inference
 
-This tool uses a **Bayesian Network** to reason *backward* from observed signals to hidden causes:
+This tool uses a **Bayesian Network** to reason *backward* from observed signals to hidden causes — a form of **abductive inference** (inference to the best explanation):
 
 ```
 Given: returned = Yes + observable order signals
 Infer: P(root_cause | evidence) for 5 competing causes
-Find:  Which cause has the highest diagnostic lift?
+Find:  Which cause is most consistent with the observed evidence?
 ```
 
-**Why BN and not regression?** Regression predicts *P(returned | features)* — whether a return happens. A BN computes *P(cause | returned=Yes, signals)* — **why** it happened. This is the information merchandising teams need.
+**Why BN and not regression?** Regression predicts *P(returned | features)* — whether a return will happen. A BN computes *P(cause | returned=Yes, signals)* — which explanation best fits the observed pattern. Three capabilities make BN the right technique here:
+
+1. **Backward inference** — conditioning on the outcome (`returned=Yes`) to reason about causes. This backward component contributes 2-3x more diagnostic information than the forward signal-to-cause path.
+2. **Marginalization** — any combination of known/unknown signals (3¹² = 531K patterns) is handled natively. No imputation needed.
+3. **Explaining away** — when one cause explains the return (e.g., bracketing via multi-size order), competing causes are automatically downweighted. This competitive reasoning requires structured graphical models.
 
 ## Network Architecture
 
@@ -151,12 +155,18 @@ See the full References tab in the app for 17 citations. Key sources:
 
 ## Part of the MarTech × AI Portfolio
 
-This is **Project 2** in a portfolio demonstrating AI techniques applied to marketing:
-- Project 1: CSP-Based Campaign & Budget Planner
-- **Project 2: BN Return Root Cause Diagnosis** ← You are here
-- Project 3: HMM-Based Customer Lifecycle Segmentation (planned)
-- Project 4: MDP for Dynamic Pricing Strategy (planned)
+This is **Project 3** in a portfolio demonstrating AI techniques applied to marketing:
+
+| # | Project | AI Technique | Status |
+|---|---------|-------------|--------|
+| 1 | ContentEngine AI | LLM batch pipeline | ✅ Live |
+| 2 | CSP Campaign Planner | Constraint satisfaction | ✅ Live |
+| 3 | **Bayesian Return Diagnosis** | Bayesian Networks | ← You are here |
+| 4 | Competitor Intel Monitor | NLP + sentiment scoring | ✅ Live |
+| 5 | Journey Intelligence Engine | Markov chains + anomaly scoring | ✅ Live |
+| 6 | MDP Optimal Contact Policy | Markov Decision Process | Planned |
+| 7 | Logic Compliance Engine | Propositional/FOL logic | Planned |
 
 ---
 
-*Built by Ata Okuzcuoglu · TUM MSc Management & Technology · 2025*
+*Built by Ata Okuzcuoglu · TUM MSc Management & Technology · 2026*

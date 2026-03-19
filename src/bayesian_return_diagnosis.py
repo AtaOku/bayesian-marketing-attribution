@@ -70,6 +70,7 @@ Author: Ata Okuzcuoglu
 Course: Fundamentals of Artificial Intelligence (IN2406), TUM
 """
 
+import math
 import numpy as np
 from collections import OrderedDict
 from itertools import product as iter_product
@@ -660,12 +661,14 @@ DEFAULT_PARAMS = {
             "is_first_purchase":      0.08,  # [10] no brand sizing knowledge
             "viewed_size_guide":      0.03,  # [9] signals uncertainty
             "mobile_purchase":        0.03,  # [3] small screen less detail
+            "premium_price":          0.04,  # [19] luxury brands have inconsistent sizing across collections
         },
         "expectation_gap": {
             "base": 0.03,
-            "premium_price":     0.06,  # higher expectations
-            "is_first_purchase": 0.05,  # no brand calibration
-            "mobile_purchase":   0.03,  # screen color/detail limits
+            "premium_price":          0.06,  # higher expectations
+            "is_first_purchase":      0.05,  # no brand calibration
+            "mobile_purchase":        0.03,  # screen color/detail limits
+            "social_media_referral":  0.03,  # [3] filtered photos distort product appearance
         },
         "impulse_regret": {
             "base": 0.02,
@@ -682,6 +685,8 @@ DEFAULT_PARAMS = {
             "young_customer_without":  0.00,  # no multi-size = no bracketing
             "high_return_history_with":  0.08,  # serial returners bracket
             "high_return_history_without": 0.00,  # no multi-size = no bracketing
+            "size_sensitive_category_with": 0.05,  # [7] 48% bracket when sizing unclear; fit-sensitive = unclear
+            "size_sensitive_category_without": 0.00,  # no multi-size = no bracketing
         },
         "quality_or_damage": {
             "base": 0.03,
@@ -735,7 +740,8 @@ def get_params(custom_params=None):
         Complete parameter set.
     """
     if custom_params is None:
-        return dict(DEFAULT_PARAMS)
+        import copy
+        return copy.deepcopy(DEFAULT_PARAMS)
     return _deep_merge(DEFAULT_PARAMS, custom_params)
 
 
@@ -876,6 +882,146 @@ def validate_params(params):
     return (len(errors) == 0, errors)
 
 
+# =============================================================================
+# INDUSTRY PRESETS
+# =============================================================================
+# Pre-configured parameter sets for common fashion e-commerce segments.
+# Users pick a preset, then fine-tune with their own metrics.
+
+INDUSTRY_PRESETS = OrderedDict({
+    "fast_fashion": {
+        "label": "Fast Fashion",
+        "examples": "Zara, H&M, ASOS, Boohoo, SHEIN",
+        "typical_return_rate": "30-40%",
+        "priors": {
+            "premium_price": 0.08, "purchased_on_discount": 0.55,
+            "young_customer": 0.65, "mobile_purchase": 0.78,
+            "social_media_referral": 0.35, "multi_size_order": 0.12,
+            "is_first_purchase": 0.40, "size_sensitive_category": 0.55,
+            "high_return_history": 0.20, "slow_delivery": 0.15,
+            "viewed_size_guide": 0.20, "multiple_items_in_order": 0.40,
+        },
+    },
+    "premium_luxury": {
+        "label": "Premium / Luxury",
+        "examples": "Mytheresa, NET-A-PORTER, SSENSE, MatchesFashion",
+        "typical_return_rate": "15-25%",
+        "priors": {
+            "premium_price": 0.70, "purchased_on_discount": 0.20,
+            "young_customer": 0.35, "mobile_purchase": 0.45,
+            "social_media_referral": 0.15, "multi_size_order": 0.04,
+            "is_first_purchase": 0.25, "size_sensitive_category": 0.60,
+            "high_return_history": 0.08, "slow_delivery": 0.20,
+            "viewed_size_guide": 0.35, "multiple_items_in_order": 0.25,
+        },
+    },
+    "mid_range_multi_brand": {
+        "label": "Mid-Range Multi-Brand",
+        "examples": "Zalando, FARFETCH, About You, Nordstrom",
+        "typical_return_rate": "25-35%",
+        "priors": {
+            "premium_price": 0.25, "purchased_on_discount": 0.40,
+            "young_customer": 0.55, "mobile_purchase": 0.65,
+            "social_media_referral": 0.25, "multi_size_order": 0.08,
+            "is_first_purchase": 0.35, "size_sensitive_category": 0.55,
+            "high_return_history": 0.15, "slow_delivery": 0.20,
+            "viewed_size_guide": 0.25, "multiple_items_in_order": 0.35,
+        },
+    },
+})
+
+
+def auto_calibrate_to_return_rate(target_return_rate, custom_params=None, tolerance=0.005):
+    """
+    Automatically calibrate Noisy-OR parameters to hit a target return rate.
+
+    Two-stage approach:
+    1. Adjust leak probability (fast, direct impact on baseline return rate)
+    2. If leak alone can't reach target, scale all Noisy-OR strengths uniformly
+
+    Parameters
+    ----------
+    target_return_rate : float
+        Desired P(returned=Yes), e.g. 0.38 for 38%.
+    custom_params : dict or None
+        Base parameters to calibrate from (e.g., an industry preset).
+    tolerance : float
+        Acceptable deviation from target (default: 0.5%).
+
+    Returns
+    -------
+    dict with keys:
+        - params: Full calibrated parameter dict (ready for build_return_diagnosis_network)
+        - leak: Calibrated leak value
+        - strength_scale: Multiplier applied to Noisy-OR strengths (1.0 if leak alone sufficed)
+        - achieved: Actual P(returned=Yes) of calibrated network
+        - method: "leak_only" or "leak_and_scale"
+    """
+    import copy
+    params = get_params(custom_params)
+
+    # Stage 1: Binary search on leak
+    lo, hi = 0.005, 0.50
+    best_leak, best_mr = params["outcome"]["leak"], 0.33
+    for _ in range(20):
+        mid = (lo + hi) / 2
+        tp = copy.deepcopy(params)
+        tp["outcome"]["leak"] = mid
+        test_bn = build_return_diagnosis_network(tp)
+        mr = compute_marginal_return_rate(test_bn)
+        best_leak, best_mr = mid, mr
+        if abs(mr - target_return_rate) < tolerance:
+            tp["outcome"]["leak"] = round(mid, 4)
+            return {
+                "params": tp, "leak": round(mid, 4),
+                "strength_scale": 1.0, "achieved": round(mr, 4),
+                "method": "leak_only",
+            }
+        elif mr < target_return_rate:
+            lo = mid
+        else:
+            hi = mid
+
+    # Stage 2: Leak alone wasn't enough → scale strengths
+    if best_mr > target_return_rate:
+        tp2 = copy.deepcopy(params)
+        tp2["outcome"]["leak"] = 0.005
+        lo_s, hi_s = 0.3, 1.0
+        for _ in range(20):
+            mid_s = (lo_s + hi_s) / 2
+            tp_s = copy.deepcopy(tp2)
+            for cause in tp_s["outcome"]["strengths"]:
+                tp_s["outcome"]["strengths"][cause] = round(
+                    params["outcome"]["strengths"][cause] * mid_s, 4
+                )
+            test_bn = build_return_diagnosis_network(tp_s)
+            mr = compute_marginal_return_rate(test_bn)
+            if abs(mr - target_return_rate) < tolerance:
+                return {
+                    "params": tp_s, "leak": 0.005,
+                    "strength_scale": round(mid_s, 3), "achieved": round(mr, 4),
+                    "method": "leak_and_scale",
+                }
+            elif mr < target_return_rate:
+                lo_s = mid_s
+            else:
+                hi_s = mid_s
+        return {
+            "params": tp_s, "leak": 0.005,
+            "strength_scale": round(mid_s, 3), "achieved": round(mr, 4),
+            "method": "leak_and_scale",
+        }
+
+    # Leak was already best we could do
+    tp_final = copy.deepcopy(params)
+    tp_final["outcome"]["leak"] = round(best_leak, 4)
+    return {
+        "params": tp_final, "leak": round(best_leak, 4),
+        "strength_scale": 1.0, "achieved": round(best_mr, 4),
+        "method": "leak_only",
+    }
+
+
 def build_return_diagnosis_network(custom_params=None):
     """
     Construct the Fashion Return Root Cause Diagnosis Bayesian Network.
@@ -944,36 +1090,41 @@ def build_return_diagnosis_network(custom_params=None):
     # LAYER 2: Root Cause nodes (conditional on observable parents)
     # -----------------------------------------------------------------
 
-    # SIZE MISMATCH — P(size_mismatch | size_sensitive, first_purchase, viewed_guide, mobile)
+    # SIZE MISMATCH — P(size_mismatch | size_sensitive, first_purchase, viewed_guide, mobile, premium)
     # [1][2][3] Size/fit is #1 return reason: 53-70% of fashion returns
+    # [19] Luxury brands have inconsistent sizing across collections
     size_parents = ["size_sensitive_category", "is_first_purchase",
-                    "viewed_size_guide", "mobile_purchase"]
+                    "viewed_size_guide", "mobile_purchase", "premium_price"]
     size_inc = increments["size_mismatch"]
     size_cpt = {}
-    for cat, first, guide, mobile in iter_product(YN, repeat=4):
+    for cat, first, guide, mobile, premium in iter_product(YN, repeat=5):
         base = size_inc["base"]
-        if cat == "Yes":   base += size_inc["size_sensitive_category"]
-        if first == "Yes": base += size_inc["is_first_purchase"]
-        if guide == "Yes": base += size_inc["viewed_size_guide"]
-        if mobile == "Yes": base += size_inc["mobile_purchase"]
+        if cat == "Yes":     base += size_inc["size_sensitive_category"]
+        if first == "Yes":   base += size_inc["is_first_purchase"]
+        if guide == "Yes":   base += size_inc["viewed_size_guide"]
+        if mobile == "Yes":  base += size_inc["mobile_purchase"]
+        if premium == "Yes": base += size_inc["premium_price"]
         base = min(base, 0.95)
-        size_cpt[(cat, first, guide, mobile)] = {"Yes": round(base, 3),
-                                                  "No": round(1 - base, 3)}
+        size_cpt[(cat, first, guide, mobile, premium)] = {"Yes": round(base, 3),
+                                                           "No": round(1 - base, 3)}
     bn.add_node("size_mismatch", size_parents, size_cpt, YN)
 
-    # EXPECTATION GAP — P(expectation_gap | premium_price, first_purchase, mobile)
+    # EXPECTATION GAP — P(expectation_gap | premium_price, first_purchase, mobile, social_media)
     # [4] 21% "not as described" + [1] 16% color issues
-    exp_parents = ["premium_price", "is_first_purchase", "mobile_purchase"]
+    # [3] Social media filtered photos distort product appearance
+    exp_parents = ["premium_price", "is_first_purchase", "mobile_purchase",
+                   "social_media_referral"]
     exp_inc = increments["expectation_gap"]
     exp_cpt = {}
-    for price, first, mobile in iter_product(YN, repeat=3):
+    for price, first, mobile, social in iter_product(YN, repeat=4):
         base = exp_inc["base"]
         if price == "Yes":  base += exp_inc["premium_price"]
         if first == "Yes":  base += exp_inc["is_first_purchase"]
         if mobile == "Yes": base += exp_inc["mobile_purchase"]
+        if social == "Yes": base += exp_inc["social_media_referral"]
         base = min(base, 0.95)
-        exp_cpt[(price, first, mobile)] = {"Yes": round(base, 3),
-                                            "No": round(1 - base, 3)}
+        exp_cpt[(price, first, mobile, social)] = {"Yes": round(base, 3),
+                                                    "No": round(1 - base, 3)}
     bn.add_node("expectation_gap", exp_parents, exp_cpt, YN)
 
     # IMPULSE REGRET — P(impulse_regret | discount, social_media, mobile, young)
@@ -993,23 +1144,27 @@ def build_return_diagnosis_network(custom_params=None):
                                                    "No": round(1 - base, 3)}
     bn.add_node("impulse_regret", imp_parents, imp_cpt, YN)
 
-    # BRACKETING — P(bracketing | multi_size_order, young, high_return_history)
+    # BRACKETING — P(bracketing | multi_size_order, young, high_return_history, size_sensitive)
     # [5] 51% of Gen Z bracket; [6] ~15% of returns from bracketing
-    brack_parents = ["multi_size_order", "young_customer", "high_return_history"]
+    # [7] 48% bracket when sizing unclear — fit-sensitive categories = unclear sizing
+    brack_parents = ["multi_size_order", "young_customer", "high_return_history",
+                     "size_sensitive_category"]
     brack_inc = increments["bracketing"]
     brack_cpt = {}
-    for multi, young, history in iter_product(YN, repeat=3):
+    for multi, young, history, cat in iter_product(YN, repeat=4):
         if multi == "Yes":
             base = brack_inc["base_with_multi_size"]
             if young == "Yes":   base += brack_inc["young_customer_with"]
             if history == "Yes": base += brack_inc["high_return_history_with"]
+            if cat == "Yes":     base += brack_inc["size_sensitive_category_with"]
         else:
             base = brack_inc["base_without_multi_size"]
             if young == "Yes":   base += brack_inc["young_customer_without"]
             if history == "Yes": base += brack_inc["high_return_history_without"]
+            if cat == "Yes":     base += brack_inc["size_sensitive_category_without"]
         base = min(base, 0.95)
-        brack_cpt[(multi, young, history)] = {"Yes": round(base, 3),
-                                               "No": round(1 - base, 3)}
+        brack_cpt[(multi, young, history, cat)] = {"Yes": round(base, 3),
+                                                    "No": round(1 - base, 3)}
     bn.add_node("bracketing", brack_parents, brack_cpt, YN)
 
     # QUALITY/DAMAGE — P(quality_or_damage | slow_delivery, multiple_items, premium)
@@ -1057,8 +1212,299 @@ def build_return_diagnosis_network(custom_params=None):
 
 
 # =============================================================================
-# DIAGNOSTIC INFERENCE API
+# CUSTOMER SEGMENT MODEL (Extended Network)
 # =============================================================================
+# Addresses the observable independence assumption by adding a latent
+# "customer segment" node that induces correlations between signals.
+#
+# Without this: P(young | social=Yes) = P(young) = 55% (independent)
+# With this:    P(young | social=Yes) = 72% (correlated via shared segment)
+#
+# The segment node is binary-encoded as (seg_a, seg_b) to preserve
+# the joint table approach. 4 segments → 2 bits → 20 total nodes.
+# Joint table: 2^20 = 1,048,576 entries (~8MB). Build: ~14s, query: ~16ms.
+
+CUSTOMER_SEGMENTS = OrderedDict({
+    "gen_z_impulse": {
+        "label": "Gen Z Impulse Shopper",
+        "prior": 0.25,
+        "encoding": (0, 0),  # seg_a=No, seg_b=No
+        "description": "Young, social-media-driven, mobile-first, discount-motivated",
+    },
+    "premium_seeker": {
+        "label": "Premium Seeker",
+        "prior": 0.15,
+        "encoding": (0, 1),  # seg_a=No, seg_b=Yes
+        "description": "Quality-focused, desktop-leaning, rarely discounted",
+    },
+    "serial_bracketer": {
+        "label": "Serial Bracketer",
+        "prior": 0.10,
+        "encoding": (1, 0),  # seg_a=Yes, seg_b=No
+        "description": "Returning customer who regularly orders multiple sizes",
+    },
+    "mainstream": {
+        "label": "Mainstream Shopper",
+        "prior": 0.50,
+        "encoding": (1, 1),  # seg_a=Yes, seg_b=Yes
+        "description": "Average shopping behavior, moderate across all signals",
+    },
+})
+
+# P(observable | segment) — how each segment shifts observable priors
+# Calibrated so that marginal P(obs) ≈ DEFAULT_PARAMS priors when mixed.
+SEGMENT_PROFILES = {
+    "gen_z_impulse": {
+        "young_customer": 0.92, "social_media_referral": 0.55, "mobile_purchase": 0.88,
+        "purchased_on_discount": 0.60, "is_first_purchase": 0.45, "premium_price": 0.08,
+        "multi_size_order": 0.12, "high_return_history": 0.20, "size_sensitive_category": 0.55,
+        "viewed_size_guide": 0.15, "slow_delivery": 0.20, "multiple_items_in_order": 0.40,
+    },
+    "premium_seeker": {
+        "young_customer": 0.35, "social_media_referral": 0.15, "mobile_purchase": 0.45,
+        "purchased_on_discount": 0.15, "is_first_purchase": 0.30, "premium_price": 0.75,
+        "multi_size_order": 0.05, "high_return_history": 0.10, "size_sensitive_category": 0.60,
+        "viewed_size_guide": 0.40, "slow_delivery": 0.20, "multiple_items_in_order": 0.25,
+    },
+    "serial_bracketer": {
+        "young_customer": 0.70, "social_media_referral": 0.30, "mobile_purchase": 0.75,
+        "purchased_on_discount": 0.45, "is_first_purchase": 0.15, "premium_price": 0.18,
+        "multi_size_order": 0.55, "high_return_history": 0.65, "size_sensitive_category": 0.70,
+        "viewed_size_guide": 0.30, "slow_delivery": 0.20, "multiple_items_in_order": 0.50,
+    },
+    "mainstream": {
+        "young_customer": 0.42, "social_media_referral": 0.13, "mobile_purchase": 0.57,
+        "purchased_on_discount": 0.37, "is_first_purchase": 0.37, "premium_price": 0.13,
+        "multi_size_order": 0.02, "high_return_history": 0.08, "size_sensitive_category": 0.48,
+        "viewed_size_guide": 0.25, "slow_delivery": 0.20, "multiple_items_in_order": 0.32,
+    },
+}
+
+
+def build_segment_network(custom_params=None):
+    """
+    Construct the extended network with a latent customer segment node.
+
+    Adds a 4-value customer segment (binary-encoded as seg_a, seg_b) that
+    induces correlations between observable signals. The root cause CPTs
+    and Noisy-OR outcome model are identical to the standard network.
+
+    Network topology (20 nodes, 36 edges):
+
+    SEGMENT (latent)      OBSERVABLE SIGNALS          ROOT CAUSES        OUTCOME
+    ════════════════      ═══════════════════         ═══════════        ═══════
+    seg_a ──┐
+            ├──→ size_sensitive_category ─┐
+    seg_b ──┤    is_first_purchase ───────┼─→ size_mismatch ─────┐
+            ├──→ viewed_size_guide ───────┤                       │
+            ├──→ mobile_purchase ─────────┘                       │
+            ├──→ premium_price ───────────┐                       │
+            │    is_first_purchase ───────┼─→ expectation_gap ────┤
+            │    mobile_purchase ─────────┘                       │
+            ├──→ purchased_on_discount ───┐                       ├─→ returned
+            ├──→ social_media_referral ───┼─→ impulse_regret ─────┤
+            │    mobile_purchase ─────────┤                       │
+            ├──→ young_customer ──────────┘                       │
+            ├──→ multi_size_order ────────┐                       │
+            │    young_customer ──────────┼─→ bracketing ─────────┤
+            ├──→ high_return_history ─────┘                       │
+            ├──→ slow_delivery ───────────┐                       │
+            ├──→ multiple_items_in_order ─┼─→ quality_or_damage ──┘
+            │    premium_price ───────────┘
+            └──→ ... (all 12 observables)
+
+    Returns
+    -------
+    BayesNet
+        Extended network with customer segment. 20 nodes, 2^20 = 1,048,576 states.
+    """
+    bn = BayesNet()
+    YN = ["Yes", "No"]
+
+    params = get_params(custom_params)
+    increments = params["increments"]
+    outcome = params["outcome"]
+
+    # --- SEGMENT ENCODING ---
+    # Binary-encode 4 segments as (seg_a, seg_b):
+    # (No, No)=gen_z, (No, Yes)=premium, (Yes, No)=serial, (Yes, Yes)=mainstream
+    seg_priors = {s: CUSTOMER_SEGMENTS[s]["prior"] for s in CUSTOMER_SEGMENTS}
+    p_seg_a_yes = seg_priors["serial_bracketer"] + seg_priors["mainstream"]
+    p_seg_b_given_a_no = seg_priors["premium_seeker"] / (seg_priors["gen_z_impulse"] + seg_priors["premium_seeker"])
+    p_seg_b_given_a_yes = seg_priors["mainstream"] / (seg_priors["serial_bracketer"] + seg_priors["mainstream"])
+
+    bn.add_node("seg_a", [], {
+        (): {"Yes": round(p_seg_a_yes, 4), "No": round(1 - p_seg_a_yes, 4)}
+    }, YN)
+    bn.add_node("seg_b", ["seg_a"], {
+        ("Yes",): {"Yes": round(p_seg_b_given_a_yes, 4), "No": round(1 - p_seg_b_given_a_yes, 4)},
+        ("No",): {"Yes": round(p_seg_b_given_a_no, 4), "No": round(1 - p_seg_b_given_a_no, 4)},
+    }, YN)
+
+    # --- OBSERVABLES (conditioned on segment) ---
+    for obs in OBSERVABLE_NODES:
+        obs_cpt = {}
+        for sa, sb in iter_product(YN, repeat=2):
+            if sa == "No" and sb == "No":
+                seg = "gen_z_impulse"
+            elif sa == "No" and sb == "Yes":
+                seg = "premium_seeker"
+            elif sa == "Yes" and sb == "No":
+                seg = "serial_bracketer"
+            else:
+                seg = "mainstream"
+            p_yes = SEGMENT_PROFILES[seg][obs]
+            obs_cpt[(sa, sb)] = {"Yes": round(p_yes, 4), "No": round(1 - p_yes, 4)}
+        bn.add_node(obs, ["seg_a", "seg_b"], obs_cpt, YN)
+
+    # --- ROOT CAUSES (identical to standard network) ---
+    # SIZE MISMATCH
+    size_parents = ["size_sensitive_category", "is_first_purchase",
+                    "viewed_size_guide", "mobile_purchase", "premium_price"]
+    size_inc = increments["size_mismatch"]
+    size_cpt = {}
+    for cat, first, guide, mobile, premium in iter_product(YN, repeat=5):
+        base = size_inc["base"]
+        if cat == "Yes":     base += size_inc["size_sensitive_category"]
+        if first == "Yes":   base += size_inc["is_first_purchase"]
+        if guide == "Yes":   base += size_inc["viewed_size_guide"]
+        if mobile == "Yes":  base += size_inc["mobile_purchase"]
+        if premium == "Yes": base += size_inc["premium_price"]
+        base = min(base, 0.95)
+        size_cpt[(cat, first, guide, mobile, premium)] = {"Yes": round(base, 3), "No": round(1 - base, 3)}
+    bn.add_node("size_mismatch", size_parents, size_cpt, YN)
+
+    # EXPECTATION GAP
+    exp_parents = ["premium_price", "is_first_purchase", "mobile_purchase",
+                   "social_media_referral"]
+    exp_inc = increments["expectation_gap"]
+    exp_cpt = {}
+    for price, first, mobile, social in iter_product(YN, repeat=4):
+        base = exp_inc["base"]
+        if price == "Yes":  base += exp_inc["premium_price"]
+        if first == "Yes":  base += exp_inc["is_first_purchase"]
+        if mobile == "Yes": base += exp_inc["mobile_purchase"]
+        if social == "Yes": base += exp_inc["social_media_referral"]
+        base = min(base, 0.95)
+        exp_cpt[(price, first, mobile, social)] = {"Yes": round(base, 3), "No": round(1 - base, 3)}
+    bn.add_node("expectation_gap", exp_parents, exp_cpt, YN)
+
+    # IMPULSE REGRET
+    imp_parents = ["purchased_on_discount", "social_media_referral",
+                   "mobile_purchase", "young_customer"]
+    imp_inc = increments["impulse_regret"]
+    imp_cpt = {}
+    for disc, social, mobile, young in iter_product(YN, repeat=4):
+        base = imp_inc["base"]
+        if disc == "Yes":    base += imp_inc["purchased_on_discount"]
+        if social == "Yes":  base += imp_inc["social_media_referral"]
+        if mobile == "Yes":  base += imp_inc["mobile_purchase"]
+        if young == "Yes":   base += imp_inc["young_customer"]
+        base = min(base, 0.95)
+        imp_cpt[(disc, social, mobile, young)] = {"Yes": round(base, 3), "No": round(1 - base, 3)}
+    bn.add_node("impulse_regret", imp_parents, imp_cpt, YN)
+
+    # BRACKETING
+    brack_parents = ["multi_size_order", "young_customer", "high_return_history",
+                     "size_sensitive_category"]
+    brack_inc = increments["bracketing"]
+    brack_cpt = {}
+    for multi, young, history, cat in iter_product(YN, repeat=4):
+        if multi == "Yes":
+            base = brack_inc["base_with_multi_size"]
+            if young == "Yes":   base += brack_inc["young_customer_with"]
+            if history == "Yes": base += brack_inc["high_return_history_with"]
+            if cat == "Yes":     base += brack_inc["size_sensitive_category_with"]
+        else:
+            base = brack_inc["base_without_multi_size"]
+            if young == "Yes":   base += brack_inc["young_customer_without"]
+            if history == "Yes": base += brack_inc["high_return_history_without"]
+            if cat == "Yes":     base += brack_inc["size_sensitive_category_without"]
+        base = min(base, 0.95)
+        brack_cpt[(multi, young, history, cat)] = {"Yes": round(base, 3), "No": round(1 - base, 3)}
+    bn.add_node("bracketing", brack_parents, brack_cpt, YN)
+
+    # QUALITY/DAMAGE
+    qual_parents = ["slow_delivery", "multiple_items_in_order", "premium_price"]
+    qual_inc = increments["quality_or_damage"]
+    qual_cpt = {}
+    for slow, multi, premium in iter_product(YN, repeat=3):
+        base = qual_inc["base"]
+        if slow == "Yes":    base += qual_inc["slow_delivery"]
+        if multi == "Yes":   base += qual_inc["multiple_items_in_order"]
+        if premium == "Yes": base += qual_inc["premium_price"]
+        base = min(base, 0.95)
+        qual_cpt[(slow, multi, premium)] = {"Yes": round(base, 3), "No": round(1 - base, 3)}
+    bn.add_node("quality_or_damage", qual_parents, qual_cpt, YN)
+
+    # OUTCOME — Noisy-OR (identical to standard network)
+    ret_parents = ROOT_CAUSE_NODES
+    ret_cpt = {}
+    LEAK = outcome["leak"]
+    CAUSE_STRENGTH = outcome["strengths"]
+    for combo in iter_product(YN, repeat=5):
+        cause_dict = dict(zip(ROOT_CAUSE_NODES, combo))
+        p_no_return = (1 - LEAK)
+        for cause, val in cause_dict.items():
+            if val == "Yes":
+                p_no_return *= (1 - CAUSE_STRENGTH[cause])
+        p_return = 1 - p_no_return
+        p_return = max(0.01, min(0.99, p_return))
+        ret_cpt[combo] = {"Yes": round(p_return, 4), "No": round(1 - p_return, 4)}
+    bn.add_node("returned", ret_parents, ret_cpt, YN)
+
+    return bn
+
+
+def infer_customer_segment(bn, evidence):
+    """
+    Infer the most probable customer segment from observed signals.
+
+    Only works with the extended (segment) network — requires seg_a, seg_b nodes.
+
+    Parameters
+    ----------
+    bn : BayesNet
+        The segment-extended network (from build_segment_network).
+    evidence : dict
+        Observed signals, e.g. {"returned": "Yes", "young_customer": "Yes", ...}
+
+    Returns
+    -------
+    list of dict
+        Sorted by posterior (highest first), each containing:
+        - name: segment key
+        - label: display label
+        - posterior: P(segment | evidence)
+        - prior: P(segment)
+    """
+    if "seg_a" not in bn.nodes:
+        return []  # Not a segment network
+
+    p_sa = bn.enumeration_ask("seg_a", evidence)
+    p_sb_given_sa_yes = bn.enumeration_ask("seg_b", dict(evidence, seg_a="Yes"))
+    p_sb_given_sa_no = bn.enumeration_ask("seg_b", dict(evidence, seg_a="No"))
+
+    results = []
+    for seg_name, seg_info in CUSTOMER_SEGMENTS.items():
+        a_val, b_val = seg_info["encoding"]  # (0,0), (0,1), (1,0), (1,1)
+        p_a = p_sa["Yes"] if a_val == 1 else p_sa["No"]
+        if a_val == 1:
+            p_b = p_sb_given_sa_yes["Yes"] if b_val == 1 else p_sb_given_sa_yes["No"]
+        else:
+            p_b = p_sb_given_sa_no["Yes"] if b_val == 1 else p_sb_given_sa_no["No"]
+        posterior = p_a * p_b
+
+        results.append({
+            "name": seg_name,
+            "label": seg_info["label"],
+            "description": seg_info["description"],
+            "posterior": round(posterior, 4),
+            "prior": seg_info["prior"],
+        })
+
+    results.sort(key=lambda x: x["posterior"], reverse=True)
+    return results
 
 def diagnose_return(bn, evidence):
     """
@@ -1299,6 +1745,19 @@ def parameter_robustness(bn, evidence, perturbation=0.20, custom_params=None):
         "stable": len(flips) == 0,
         "max_posterior_swing": round(max_swing, 4),
     }
+
+
+def posterior_entropy(results):
+    """Shannon entropy over root cause posteriors. Lower = more certain diagnosis.
+    Returns normalized entropy in [0, 1]: 0 = one cause dominates, 1 = uniform."""
+    posteriors = [r["posterior"] for r in results]
+    total = sum(posteriors)
+    if total == 0:
+        return 1.0
+    probs = [p / total for p in posteriors if p > 0]
+    raw = -sum(p * math.log2(p) for p in probs)
+    max_entropy = math.log2(len(results)) if len(results) > 1 else 1.0
+    return raw / max_entropy if max_entropy > 0 else 0.0
 
 
 # =============================================================================

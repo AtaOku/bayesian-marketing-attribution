@@ -16,10 +16,13 @@ import io
 import csv
 from src.bayesian_return_diagnosis import (
     build_return_diagnosis_network,
+    build_segment_network,
+    infer_customer_segment,
     diagnose_return,
     compute_marginal_return_rate,
     what_if_analysis,
     signal_sensitivity,
+    posterior_entropy,
     NODE_META,
     OBSERVABLE_NODES,
     ROOT_CAUSE_NODES,
@@ -33,6 +36,9 @@ from src.bayesian_return_diagnosis import (
     compute_weight,
     continuous_to_evidence_and_weights,
     apply_intensity_weights,
+    CUSTOMER_SEGMENTS,
+    INDUSTRY_PRESETS,
+    auto_calibrate_to_return_rate,
 )
 
 
@@ -43,7 +49,7 @@ st.set_page_config(
     page_title="Fashion Return Root Cause Diagnosis — Bayesian Network",
     page_icon="🔍",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 
@@ -111,6 +117,14 @@ def get_network(params_hash=None, custom_params=None):
     return net
 
 
+@st.cache_resource
+def get_segment_network(params_hash=None, custom_params=None):
+    """Build extended network with customer segment node. ~14s build, cached."""
+    net = build_segment_network(custom_params)
+    net._ensure_joint()
+    return net
+
+
 def _params_hash(params):
     """Create a hashable key from params dict for cache invalidation."""
     if params is None:
@@ -134,7 +148,7 @@ st.markdown("""
 <div class="academic-header" style="padding: 0.8rem 1.5rem;">
     <h3 style="margin:0 0 0.3rem 0;">Fashion E-Commerce Return Root Cause Diagnosis</h3>
     <div class="subtitle" style="font-size:0.88rem;">
-        A Bayesian Network that infers <em>why</em> a customer returned a fashion item — backward inference from order signals to hidden root causes.
+        A Bayesian Network that infers the most probable root cause behind a fashion return — backward inference from order signals to 5 competing explanations.
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -167,15 +181,19 @@ tab_diagnose, tab_whatif, tab_sensitivity, tab_calibrate, tab_method, tab_refs =
 # =============================================================================
 with tab_diagnose:
 
-    with st.expander("**What is this?** A Bayesian Network that diagnoses *why* customers return orders", expanded=False):
+    with st.expander("**What is this?** A Bayesian Network that diagnoses the most probable root cause behind returns", expanded=False):
         st.markdown("""
         <div style="font-size: 0.92rem; color: #4a5568; line-height: 1.7;">
             <strong>Your analytics dashboard shows <em>which</em> orders get returned.</strong>
-            This tool tells you <strong>why</strong> — inferring hidden root causes from signals already in your
-            order system (product category, customer type, device, discount, delivery time).
+            This tool infers the most probable root cause — using backward inference from signals already in your
+            order system (product category, customer type, device, discount, delivery time) through 5 competing
+            causal explanations.
             <br><br>
-            Pick a scenario on the left or set custom signals in the sidebar. The Bayesian Network below
-            runs backward inference to rank the most probable cause.
+            This is <strong>abductive inference</strong> (inference to the best explanation): given the return
+            happened and the observable signals, which root cause is most consistent with the evidence?
+            <br><br>
+            Pick a scenario or set custom signals in the sidebar. The Bayesian Network
+            runs backward inference to rank causes by diagnostic lift.
         </div>
         """, unsafe_allow_html=True)
         st.markdown("---")
@@ -241,17 +259,26 @@ with tab_diagnose:
     if "selected_scenario" not in st.session_state:
         st.session_state.selected_scenario = scenario_names[0]
 
-    btn_cols = st.columns(len(scenario_names))
-    for i, (name, col) in enumerate(zip(scenario_names, btn_cols)):
+    ROW1 = scenario_names[:4]
+    ROW2 = scenario_names[4:]
+
+    btn_cols1 = st.columns(len(ROW1))
+    for i, (name, col) in enumerate(zip(ROW1, btn_cols1)):
         with col:
             is_active = st.session_state.selected_scenario == name
-            # Short display name (remove "The ")
             short = name.replace("The ", "")
-            if st.button(
-                short, key=f"sc_{i}",
-                use_container_width=True,
-                type="primary" if is_active else "secondary",
-            ):
+            if st.button(short, key=f"sc_{i}", use_container_width=True,
+                         type="primary" if is_active else "secondary"):
+                st.session_state.selected_scenario = name
+                st.rerun()
+
+    btn_cols2 = st.columns(len(ROW2))
+    for i, (name, col) in enumerate(zip(ROW2, btn_cols2)):
+        with col:
+            is_active = st.session_state.selected_scenario == name
+            short = name.replace("The ", "")
+            if st.button(short, key=f"sc_{i+4}", use_container_width=True,
+                         type="primary" if is_active else "secondary"):
                 st.session_state.selected_scenario = name
                 st.rerun()
 
@@ -268,10 +295,15 @@ with tab_diagnose:
         )
         st.markdown(f"""
         <div style="background:#f7fafc; border:1px solid #e2e8f0; border-radius:8px;
-                    padding:0.5rem 1rem; margin:0.3rem 0 0.8rem 0; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">
-            <span style="color:#4a5568; font-size:0.85rem;">{info['subtitle']}</span>
-            <span style="color:#cbd5e0;">|</span>
-            {signal_tags}
+                    padding:0.5rem 1rem; margin:0.3rem 0 0.8rem 0;">
+            <div style="display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:0.3rem;">
+                <span style="color:#4a5568; font-size:0.85rem;">{info['subtitle']}</span>
+                <span style="color:#cbd5e0;">|</span>
+                {signal_tags}
+            </div>
+            <div style="font-size:0.8rem; color:#718096;">
+                <span style="font-weight:600;">Expected finding:</span> {info['expect']}
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -384,6 +416,8 @@ with tab_diagnose:
     # --- Apply intensity weights if continuous mode active ---
     diagnosis_bn = bn  # Default: use the top-level network (with calibration params)
 
+    t0 = time.time()
+
     if continuous_values:
         _, weights = continuous_to_evidence_and_weights(continuous_values)
         if any(abs(w - 1.0) > 0.01 for w in weights.values()):
@@ -393,13 +427,23 @@ with tab_diagnose:
             diagnosis_bn = build_return_diagnosis_network(modulated_params)
 
     # --- Run Diagnosis ---
-    t0 = time.time()
     results = diagnose_return(diagnosis_bn, evidence)
     inference_time = (time.time() - t0) * 1000
 
     marginal_return = compute_marginal_return_rate(diagnosis_bn)
 
-    col_m1, col_m2, col_m3 = st.columns(3)
+    # --- Posterior Entropy (imported from src) ---
+    normalized_entropy = posterior_entropy(results)
+
+    # Confidence hesabı (aşağıda yeniden kullanılacak)
+    if len(results) >= 2 and results[1]["lift"] > 0:
+        lift_ratio = results[0]["lift"] / results[1]["lift"]
+        confidence_label = "High" if lift_ratio >= 3.0 else ("Medium" if lift_ratio >= 1.5 else "Low")
+    else:
+        confidence_label = "—"
+        lift_ratio = 0
+
+    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
     with col_m1:
         st.metric("Baseline Return Rate", f"{marginal_return:.1%}",
                    help="Average return rate across all orders — P(returned=Yes) with no signals observed")
@@ -409,6 +453,15 @@ with tab_diagnose:
     with col_m3:
         st.metric("Inference Time", f"{inference_time:.0f} ms",
                    help="Exact enumeration over 2¹⁸ = 262,144 joint states")
+    with col_m4:
+        st.metric("Diagnostic Separation (heuristic)", confidence_label,
+                   help=f"How clearly the top cause separates from the second. "
+                        f"Lift ratio: {lift_ratio:.1f}x (top / runner-up). "
+                        "High ≥ 3x, Medium ≥ 1.5x, Low < 1.5x. "
+                        "(heuristic: lift ratio top cause / runner-up)")
+    with col_m5:
+        st.metric("Posterior Entropy", f"{normalized_entropy:.0%} uncertainty",
+                   help="0% = one cause dominates completely. 100% = all causes equally likely. Complements Diagnostic Separation.")
 
     # Show continuous weight detail if active
     if continuous_values:
@@ -424,12 +477,35 @@ with tab_diagnose:
 
     st.markdown("---")
     st.subheader("Root Cause Diagnosis")
+    st.caption("Ranked by **diagnostic lift** — how much the evidence shifts belief relative to baseline. "
+               "A cause with high lift but low posterior means the evidence is diagnostic but the cause is uncommon overall.")
 
     if not active_evidence:
         st.warning("No evidence set. Select a scenario in the sidebar or switch to Custom mode.")
 
+    # Check lift vs posterior disagreement
+    if len(results) >= 2 and active_evidence:
+        by_posterior = sorted(results, key=lambda x: x["posterior"], reverse=True)
+        if by_posterior[0]["name"] != results[0]["name"]:
+            st.markdown(f"""
+            <div style="background:#fffff0; border:1px solid #ecc94b; border-radius:8px;
+                        padding:0.6rem 1rem; margin-bottom:0.8rem; font-size:0.85rem;">
+                <strong>Note:</strong> Ranked by lift, <strong>{results[0]['label']}</strong> is top
+                (most diagnostic for this evidence pattern). But by absolute probability,
+                <strong>{by_posterior[0]['label']}</strong> has the highest posterior ({by_posterior[0]['posterior']:.0%}).
+                Lift answers "what does this evidence point to most?" — posterior answers
+                "what's most likely overall?"
+            </div>
+            """, unsafe_allow_html=True)
+
+    # Determine if lift and posterior rankings disagree
+    _highest_posterior_name = max(results, key=lambda x: x["posterior"])["name"] if results else None
+
     for i, r in enumerate(results):
         is_top = (i == 0 and r["lift"] > 1.5 and len(active_evidence) > 0)
+        is_highest_posterior = (r["name"] == _highest_posterior_name
+                                and r["name"] != results[0]["name"]
+                                and active_evidence)
         if r["lift"] >= 2.0:
             lift_class = "lift-high"
         elif r["lift"] >= 1.3:
@@ -441,11 +517,18 @@ with tab_diagnose:
         bar_pct = min(r["posterior"] * 100, 100)
         bar_color = "#e53e3e" if is_top else "#667eea"
 
+        # Badge row: lift badge + optional "highest posterior" badge
+        badges = f'<span class="lift-badge {lift_class}">{r["lift"]:.2f}x lift</span>'
+        if is_highest_posterior:
+            badges += (' <span style="display:inline-block; padding:0.2rem 0.6rem; border-radius:20px; '
+                       'font-weight:600; font-size:0.78rem; background:#ebf8ff; color:#2b6cb0;">'
+                       'highest posterior</span>')
+
         st.markdown(f"""
         <div class="{card_class}">
             <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div class="cause-name">{"" if is_top else ""}{r['label']}</div>
-                <div><span class="lift-badge {lift_class}">{r['lift']:.2f}x lift</span></div>
+                <div class="cause-name">{"🔴 " if is_top else ""}{r['label']}</div>
+                <div>{badges}</div>
             </div>
             <div style="display:flex; gap:2rem; margin-top:0.5rem; font-size:0.88rem;">
                 <div><span style="color:#718096;">Prior:</span> <strong>{r['prior']:.1%}</strong></div>
@@ -458,6 +541,61 @@ with tab_diagnose:
             <div class="cause-citation">{r['citation']}</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # --- Customer Segment Inference (extended network) ---
+    if active_evidence:
+        with st.expander("🎯 Customer Segment Inference (Extended Network)", expanded=False):
+            st.caption("Uses the extended network with a latent customer segment node (20 nodes, 1M states). "
+                       "This addresses the observable independence assumption by modeling correlations "
+                       "between signals via 4 customer archetypes.")
+            st.caption("⚠️ First load takes ~14s — network is cached after that.")
+            if st.button("Load Segment Analysis", key="load_segment", type="secondary"):
+                st.session_state["segment_loaded"] = True
+
+            if st.session_state.get("segment_loaded", False):
+                with st.spinner("Building segment network (first load ~14s, then cached)..."):
+                    bn_seg = get_segment_network(
+                        params_hash=f"seg_{_params_hash(custom_params)}",
+                        custom_params=custom_params
+                    )
+            else:
+                bn_seg = None
+            seg_results = infer_customer_segment(bn_seg, evidence) if bn_seg else None
+            if seg_results:
+                top_seg = seg_results[0]
+                st.markdown(f"""
+                <div style="background:#f0fff4; border:1px solid #68d391; border-radius:10px;
+                            padding:1rem; margin-bottom:0.8rem;">
+                    <div style="font-size:1.1rem; font-weight:600; margin-bottom:0.3rem;">
+                        {top_seg['label']} <span style="color:#38a169;">({top_seg['posterior']:.0%})</span>
+                    </div>
+                    <div style="font-size:0.85rem; color:#4a5568;">{top_seg['description']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                for s in seg_results:
+                    bar_pct = s["posterior"] * 100
+                    st.markdown(f"""
+                    <div style="display:flex; align-items:center; gap:0.8rem; margin:0.3rem 0; font-size:0.85rem;">
+                        <div style="width:200px;">{s['label']}</div>
+                        <div style="flex:1; background:#edf2f7; border-radius:4px; height:14px; overflow:hidden;">
+                            <div style="background:#48bb78; height:100%; width:{bar_pct}%;
+                                        border-radius:4px; display:flex; align-items:center;
+                                        padding-left:6px; color:white; font-size:0.72rem; font-weight:600;">
+                                {s['posterior']:.0%}
+                            </div>
+                        </div>
+                        <div style="width:50px; text-align:right; color:#718096; font-size:0.78rem;">
+                            prior: {s['prior']:.0%}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # Show induced correlations
+                st.caption("**Observable correlations (via segment):** "
+                           f"P(young|social=Yes) = {bn_seg.enumeration_ask('young_customer', {'social_media_referral': 'Yes'})['Yes']:.0%} "
+                           f"(vs {DEFAULT_PARAMS['priors']['young_customer']:.0%} independent) · "
+                           f"P(premium|discount=Yes) = {bn_seg.enumeration_ask('premium_price', {'purchased_on_discount': 'Yes'})['Yes']:.0%} "
+                           f"(vs {DEFAULT_PARAMS['priors']['premium_price']:.0%} independent)")
 
     # Actionable insight
     if active_evidence and results[0]["lift"] > 1.5:
@@ -513,7 +651,38 @@ with tab_diagnose:
         }
         st.markdown(interventions.get(top["name"], "Review order patterns for this segment."))
         st.caption("These are **illustrative examples** based on industry research — not prescriptions. "
-                   "Your optimal intervention depends on your platform, customer base, and business model.")# =============================================================================
+                   "Your optimal intervention depends on your platform, customer base, and business model.")
+
+    # Signal sharpening: suggest unset signals that would improve discrimination
+    if active_evidence and len(results) >= 2:
+        _lr = results[0]["lift"] / results[1]["lift"] if results[1]["lift"] > 0 else 99
+        if _lr < 2.0:  # diagnosis is not sharply separated
+            unset_signals = [n for n in OBSERVABLE_NODES if n not in active_evidence]
+            sharpening_signals = []
+            for sig in unset_signals:
+                for val in ["Yes", "No"]:
+                    test_ev = dict(evidence, **{sig: val})
+                    test_results = diagnose_return(diagnosis_bn, test_ev)
+                    if len(test_results) >= 2 and test_results[1]["lift"] > 0:
+                        new_ratio = test_results[0]["lift"] / test_results[1]["lift"]
+                        if new_ratio > _lr * 1.3:  # at least 30% improvement
+                            sharpening_signals.append({
+                                "signal": NODE_META[sig]["label"],
+                                "value": val,
+                                "new_ratio": new_ratio,
+                                "new_top": test_results[0]["label"],
+                            })
+            if sharpening_signals:
+                sharpening_signals.sort(key=lambda x: x["new_ratio"], reverse=True)
+                st.markdown("---")
+                st.markdown("#### Sharpen This Diagnosis")
+                st.caption(f"Current discrimination is **low** (lift ratio: {_lr:.1f}x). "
+                           "Setting one of these signals would help distinguish the top cause more clearly:")
+                for s in sharpening_signals[:4]:
+                    st.markdown(f"- Set **{s['signal']}** = {s['value']} → top cause: "
+                                f"**{s['new_top']}** (lift ratio: {s['new_ratio']:.1f}x)")
+
+# =============================================================================
 # TAB 2: WHAT-IF SIMULATION
 # =============================================================================
 with tab_whatif:
@@ -532,7 +701,7 @@ with tab_whatif:
 
     with col_wi1:
         st.markdown("**Baseline Scenario:**")
-        wi_evidence = {"returned": "Yes"}
+        wi_signals = {}
         for node in OBSERVABLE_NODES:
             wi_val = st.selectbox(
                 NODE_META[node]["label"],
@@ -541,7 +710,7 @@ with tab_whatif:
                 help=NODE_META[node]["description"],
             )
             if wi_val != "N/A":
-                wi_evidence[node] = wi_val
+                wi_signals[node] = wi_val
 
     with col_wi2:
         st.markdown("**Intervention:**")
@@ -555,7 +724,8 @@ with tab_whatif:
         )
 
         if st.button("Run What-If Analysis", type="primary", use_container_width=True):
-            result = what_if_analysis(bn, wi_evidence, intervention_node, intervention_value)
+            # Return probability: P(returned | signals) WITHOUT returned=Yes in evidence
+            result = what_if_analysis(bn, wi_signals, intervention_node, intervention_value)
 
             st.markdown(f"""
             <div class="whatif-card">
@@ -564,9 +734,9 @@ with tab_whatif:
                     <code>{NODE_META[intervention_node]['label']}</code> = <code>{intervention_value}</code>
                 </div>
                 <div style="display:flex; gap:1.5rem; font-size:1.1rem;">
-                    <div><span style="color:#718096;">Before:</span> <strong>{result['current_return_prob']:.1%}</strong></div>
+                    <div><span style="color:#718096;">P(return) before:</span> <strong>{result['current_return_prob']:.1%}</strong></div>
                     <div style="font-size:1.5rem;">→</div>
-                    <div><span style="color:#718096;">After:</span> <strong>{result['new_return_prob']:.1%}</strong></div>
+                    <div><span style="color:#718096;">P(return) after:</span> <strong>{result['new_return_prob']:.1%}</strong></div>
                     <div>
                         <span style="color:#718096;">Δ</span>
                         <strong style="color:{'#38a169' if result['change'] < 0 else '#e53e3e'};">
@@ -577,11 +747,12 @@ with tab_whatif:
             </div>
             """, unsafe_allow_html=True)
 
-            new_ev = dict(wi_evidence)
-            new_ev[intervention_node] = intervention_value
-            new_results = diagnose_return(bn, new_ev)
+            # Root cause diagnosis: P(cause | returned=Yes, signals + intervention)
+            new_ev_diag = dict(wi_signals, returned="Yes")
+            new_ev_diag[intervention_node] = intervention_value
+            new_results = diagnose_return(bn, new_ev_diag)
 
-            st.markdown("**Updated Root Cause Distribution:**")
+            st.markdown("**Root Cause Distribution (given return happened):**")
             wi_max_posterior = max(r["posterior"] for r in new_results) if new_results else 1.0
             for r in new_results:
                 bar_pct = (r["posterior"] / wi_max_posterior * 100) if wi_max_posterior > 0 else 0
@@ -622,7 +793,10 @@ with tab_sensitivity:
                "to measure its individual effect on return probability.")
 
     # Cache key based on params
-    _sens_key = f"sens_{hash(str(st.session_state.get('custom_params')))}"
+    import json, hashlib as _hl
+    _cp = st.session_state.get('custom_params')
+    _cp_str = json.dumps(_cp, sort_keys=True) if _cp else "default"
+    _sens_key = f"sens_{_hl.md5(_cp_str.encode()).hexdigest()}"
     if _sens_key not in st.session_state:
         with st.spinner("Running sensitivity across all 12 signals..."):
             st.session_state[_sens_key] = signal_sensitivity(bn)
@@ -690,6 +864,21 @@ with tab_sensitivity:
         st.caption(f"Baseline P(returned=Yes) = {mr:.1%}. "
                    "Adjust parameters in the Calibration tab — this analysis updates automatically.")
 
+        # Two-regime insight
+        if sens_results and sens_results[0]["abs_swing"] > 0.3:
+            dominant = sens_results[0]
+            rest_swing = sum(r["abs_swing"] for r in sens_results[1:])
+            st.markdown(f"""
+            <div class="method-box">
+            <strong>Key insight: Two-regime detection.</strong>
+            {dominant['label']} alone produces a {dominant['abs_swing']:.0%} swing — larger than all other
+            11 signals combined ({rest_swing:.0%}). Information-theoretically, it provides ~80% of all diagnostic
+            value. This means the model operates in two regimes: (1) when {dominant['label'].lower()} is observed,
+            the diagnosis is sharp; (2) when it's absent, the remaining signals provide modest discrimination
+            among the other four causes. See Methodology §10 for the full information content analysis.
+            </div>
+            """, unsafe_allow_html=True)
+
 
 # =============================================================================
 # TAB 4: CALIBRATION — "Does this work with my own data?"
@@ -723,7 +912,7 @@ with tab_calibrate:
     # --- Tabs within calibration ---
     cal_mode = st.radio(
         "Calibration mode:",
-        ["Quick Mode (Priors + Strengths)", "Advanced (All CPT Increments)", "CSV Import/Export"],
+        ["Guided Setup", "Quick Mode (Priors + Strengths)", "Advanced (All CPT Increments)", "CSV Import/Export"],
         horizontal=True,
         key="cal_mode",
     )
@@ -731,9 +920,111 @@ with tab_calibrate:
     current_params = get_params(st.session_state.custom_params)
 
     # ---------------------------------------------------------------
+    # GUIDED SETUP: Preset + business questions + auto-calibration
+    # ---------------------------------------------------------------
+    if cal_mode == "Guided Setup":
+
+        st.markdown("#### Step 1: Pick your segment")
+        st.caption("Start with the preset closest to your business. You'll fine-tune in Step 2.")
+
+        preset_cols = st.columns(len(INDUSTRY_PRESETS))
+        selected_preset = st.session_state.get("guided_preset", "mid_range_multi_brand")
+
+        for i, (key, preset) in enumerate(INDUSTRY_PRESETS.items()):
+            with preset_cols[i]:
+                is_active = selected_preset == key
+                if st.button(
+                    preset["label"],
+                    key=f"preset_{key}",
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary",
+                ):
+                    st.session_state.guided_preset = key
+                    st.rerun()
+                st.caption(f'{preset["examples"]}\n\nTypical return rate: {preset["typical_return_rate"]}')
+
+        active_preset = INDUSTRY_PRESETS[selected_preset]
+
+        st.markdown("---")
+        st.markdown("#### Step 2: Your numbers")
+        st.caption("Answer what you know — leave the rest at the preset defaults.")
+
+        gc1, gc2 = st.columns(2)
+        with gc1:
+            target_return = st.slider(
+                "Your overall return rate",
+                min_value=10, max_value=50, value=33, step=1,
+                key="guided_return_rate",
+                help="The model will auto-calibrate to match this rate.",
+            )
+            guided_mobile = st.slider(
+                "Mobile order share (%)",
+                min_value=20, max_value=95,
+                value=int(active_preset["priors"]["mobile_purchase"] * 100),
+                step=5, key="guided_mobile",
+            )
+            guided_young = st.slider(
+                "Customers under 40 (%)",
+                min_value=15, max_value=85,
+                value=int(active_preset["priors"]["young_customer"] * 100),
+                step=5, key="guided_young",
+            )
+        with gc2:
+            guided_social = st.slider(
+                "Social media traffic (%)",
+                min_value=5, max_value=60,
+                value=int(active_preset["priors"]["social_media_referral"] * 100),
+                step=5, key="guided_social",
+            )
+            guided_discount = st.slider(
+                "Orders with discount (%)",
+                min_value=5, max_value=80,
+                value=int(active_preset["priors"]["purchased_on_discount"] * 100),
+                step=5, key="guided_discount",
+            )
+            guided_bracket = st.slider(
+                "Multi-size orders / bracketing (%)",
+                min_value=1, max_value=25,
+                value=int(active_preset["priors"]["multi_size_order"] * 100),
+                step=1, key="guided_bracket",
+            )
+
+        st.markdown("---")
+        st.markdown("#### Step 3: Auto-calibrate")
+
+        # Build params from preset + user overrides
+        import copy
+        guided_params = copy.deepcopy(active_preset)
+        guided_params["priors"]["mobile_purchase"] = guided_mobile / 100
+        guided_params["priors"]["young_customer"] = guided_young / 100
+        guided_params["priors"]["social_media_referral"] = guided_social / 100
+        guided_params["priors"]["purchased_on_discount"] = guided_discount / 100
+        guided_params["priors"]["multi_size_order"] = guided_bracket / 100
+
+        # Auto-calibrate to target return rate
+        cal_result = auto_calibrate_to_return_rate(target_return / 100, guided_params)
+
+        cal_cols = st.columns(3)
+        cal_cols[0].metric("Target Return Rate", f"{target_return}%")
+        cal_cols[1].metric("Achieved", f"{cal_result['achieved']:.1%}",
+                           delta=f"{cal_result['achieved'] - target_return/100:+.1%}",
+                           delta_color="inverse")
+        cal_cols[2].metric("Method",
+                           "Leak adjusted" if cal_result["method"] == "leak_only"
+                           else f"Leak + strengths ×{cal_result['strength_scale']}",
+                           help="**Leak adjusted:** Only the background noise probability was tuned to reach your target return rate. "
+                                "**Leak + strengths:** The target rate required also scaling the Noisy-OR cause strengths. "
+                                "Larger strength_scale = bigger adjustment from defaults.")
+
+        if st.button("Apply Guided Calibration", type="primary", use_container_width=True,
+                     key="apply_guided"):
+            st.session_state.custom_params = cal_result["params"]
+            st.rerun()
+
+    # ---------------------------------------------------------------
     # QUICK MODE: Observable priors + Noisy-OR strengths
     # ---------------------------------------------------------------
-    if cal_mode == "Quick Mode (Priors + Strengths)":
+    elif cal_mode == "Quick Mode (Priors + Strengths)":
 
         st.markdown("#### Observable Signal Priors")
         st.caption("P(signal = Yes) — What fraction of your orders have each characteristic?")
@@ -1041,19 +1332,24 @@ with tab_method:
 
     st.markdown("#### 2. Why Bayesian Networks?")
     st.markdown("""
-    The critical distinction is **backward (diagnostic) inference** vs. forward prediction:
+    This is a problem of **abductive inference** — inference to the best explanation. Given that
+    a return happened, which root cause hypothesis best explains the observable evidence? Three
+    specific capabilities make BN the right technique:
 
-    | Capability | BN | Dashboard / BI | Logistic Regression |
-    |---|---|---|---|
-    | Backward inference (effect → cause) | ✅ Bayes' theorem | ❌ | ❌ |
-    | Missing data handling | ✅ Marginalization | ❌ Imputation | ❌ Imputation |
-    | Causal structure | ✅ DAG | ❌ Correlation | ❌ Correlation |
-    | Interpretability | ✅ CPTs readable | ✅ | ⚠️ Coefficients |
-    | What-if reasoning | ✅ | ❌ | ⚠️ Limited |
+    | Capability | BN | Dashboard / BI | Logistic Regression | Naive Bayes |
+    |---|---|---|---|---|
+    | Backward inference (effect → cause) | ✅ Bayes' theorem | ❌ | ❌ | ⚠️ No outcome node |
+    | Missing data handling | ✅ Marginalization | ❌ Imputation | ❌ Imputation | ✅ Ignores missing |
+    | Explaining away (competitive causes) | ✅ Shared parent structure | ❌ | ❌ | ❌ |
+    | Causal structure | ✅ DAG | ❌ Correlation | ❌ Correlation | ❌ |
+    | Works without training data | ✅ Expert-calibrated | ✅ | ❌ Needs labels | ❌ Needs labels |
+    | What-if reasoning | ✅ | ❌ | ⚠️ Limited | ❌ |
 
     **Key insight:** Regression predicts *P(returned | features)* — whether a return will happen.
-    A BN computes *P(root_cause | returned=Yes, signals)* — **why** it happened. This is the
-    information a merchandising team actually needs to take action.
+    A BN computes *P(root_cause | returned=Yes, signals)* — which explanation best fits the
+    observed pattern. The backward component (`returned=Yes` conditioning) contributes **2-3x more**
+    to the diagnosis than the forward signal-to-cause path. This directional reasoning is the
+    network's core value.
     """)
 
     st.markdown("#### 3. Formal Definition")
@@ -1168,23 +1464,86 @@ with tab_method:
     via marginalization (8% prior × 77% conditional ≈ 6%), which is correct Bayesian reasoning.
     """)
 
-    st.markdown("#### 9. Limitations & Future Work")
+    st.markdown("#### 9. Structural Assumptions")
+    st.markdown("""
+    The network makes four structural assumptions. Understanding them is key to interpreting results correctly.
+
+    **1. Additive CPTs (no interaction effects).** Each parent contributes independently to a cause:
+    P(cause) = base + Σ(incrementᵢ × parentᵢ). For size_mismatch, `first_purchase=Yes` adds +8%
+    and `mobile=Yes` adds +3%, regardless of each other. In reality, a first-time buyer on mobile
+    might face *compounding* difficulty. The additive model can't capture this, but with
+    expert-calibrated parameters (not learned from data), interaction terms would be unjustified.
+
+    **2. Observable independence (weakest assumption).** All 12 signals are root nodes — they're
+    unconditionally independent: P(young | social=Yes) = P(young) = 55%. In reality, Gen Z
+    uses social media more, young customers use mobile more, and premium items rarely have deep
+    discounts. The model can't recognize coherent customer profiles like "Gen Z impulse shopper."
+    A latent "customer segment" node would address this — it's the single highest-value structural improvement.
+
+    **3. Noisy-OR outcome (cause independence for returns).** Each cause independently contributes
+    to return probability. This is reasonable: returns are typically triggered by the single worst
+    issue. The "any sufficient cause" logic matches how customers actually decide to return.
+
+    **4. Binary discretization.** All variables are Yes/No. Mitigated by the Continuous Input Mode,
+    which modulates CPT increments via interpolation between research-grounded reference points while
+    preserving the binary network structure.
+    """)
+
+    st.markdown("#### 10. Information Content Analysis")
+    st.markdown("""
+    Mutual information analysis reveals that **Multi-Size Order provides ~80% of all diagnostic
+    information** about root causes. The remaining 11 signals collectively provide only ~20%.
+
+    | Signal | Information (bits) | Share |
+    |--------|-------------------|-------|
+    | Multi-Size Order | 0.674 | 80% |
+    | Size-Sensitive Category | 0.043 | 5% |
+    | First Purchase | 0.019 | 2% |
+    | All other 9 signals | 0.104 | 13% |
+
+    **Interpretation:** The model is a **two-regime detector.** When multi_size=Yes, bracketing
+    dominates with near-certainty (14-15x lift). When multi_size=No or unknown, the remaining
+    signals provide modest discrimination among the other four causes — explaining why the
+    Diagnosis Confidence metric shows "Low" for scenarios without multi-size order.
+
+    This is not a model flaw — it reflects reality. Bracketing has a near-deterministic observable
+    signature (you can see multi-size orders in the data). The other causes are genuinely ambiguous
+    from order-level signals alone. Post-return feedback, product-level features (fit type, photo
+    quality score), or customer review sentiment would be needed to discriminate further.
+    """)
+
+    st.markdown("#### 11. Potential Missing Edges")
+    st.markdown("""
+    Four plausible edges are absent from the current DAG. Adding them would require empirical
+    evidence, but they represent the most likely structural improvements:
+
+    | Missing Edge | Rationale |
+    |---|---|
+    | premium_price → size_mismatch | Luxury brands often have inconsistent sizing across collections |
+    | social_media_referral → expectation_gap | Social media filters distort product appearance |
+    | purchased_on_discount → quality_or_damage | Discounted items may be older inventory with quality issues |
+    | high_return_history → size_mismatch | Serial returners may systematically misjudge brand sizing |
+    """)
+
+    st.markdown("#### 12. Limitations & Future Work")
     st.markdown("""
     - **CPTs are expert-calibrated, not learned from data.** The ⚙️ Calibration tab allows
       adjusting priors, CPT increments, and Noisy-OR strengths to match your platform's data.
       With access to real order-level data, parameter learning (MLE or Bayesian estimation,
       Russell & Norvig Ch. 20) could automate this. Structure learning (e.g., NOTEARS, PC
       algorithm) could discover edges.
-    - **Observational conditioning ≠ causal intervention.** The What-If tab uses P(Y|X=x),
-      not P(Y|do(X=x)). True causal reasoning requires graph surgery (Pearl, 2009).
-    - **Binary discretization** simplifies continuous variables. Multi-valued domains
-      (e.g., delivery_days: Fast/Normal/Slow) would increase expressiveness at the cost
-      of larger CPTs.
+    - **Abductive inference ≠ causal inference.** The model computes P(cause | evidence) —
+      which explanation best fits the observations. The What-If tab uses observational conditioning
+      P(Y|X=x), not causal intervention P(Y|do(X=x)). True causal reasoning requires graph
+      surgery (Pearl, 2009). The distinction: this tool tells you which cause is *most consistent
+      with the evidence*, not what *caused* the return.
+    - **Binary discretization** simplifies continuous variables. The Continuous Input Mode
+      (see sidebar toggle) mitigates this via intensity-weighted CPT modulation.
     - **No temporal dynamics.** A Dynamic Bayesian Network could model how return behavior
-      changes across a customer's lifecycle (see Project 3: HMM-Based Segmentation).
+      changes across a customer's lifecycle.
     """)
 
-    st.markdown("#### 8. Input Validation")
+    st.markdown("#### 13. Input Validation")
     st.markdown("""
     The Calibration tab accepts user-provided parameters via sliders and CSV upload.
     To prevent invalid network states, all inputs are validated:
@@ -1218,6 +1577,10 @@ with tab_refs:
         "[8] **MIT Sloan / Hauser et al.** (2024). 'How Better Predictive Models Could Lead to Fewer Clothing Returns.' Form-fitting garments returned more than casual. Horizontal stripes returned less than vertical. Color + images improve return prediction.",
         "[9] **ScienceDirect** (2025). 'Fits Like a Glove? Knowledge and Use of Size Finders and High-End Fashion Retail Returns.' Size finder users 0.65% MORE likely to return. n=496,365 items, 75,707 customers, 113 countries, July 2015–April 2022. Swedish fashion e-commerce platform.",
         "[10] **McKinsey & Company** (2021). 'Returning to Order: Improving Returns Management for Apparel Companies.' 25% return rate apparel e-commerce pre-COVID. Returns management not top-5 priority for 1/3 of retailers. First-time online shoppers: 67% higher return rates.",
+        "[19] **Industry Return Rate Benchmarks** (various). Return rate by price segment: luxury 15-20%, mid-range 25-30%, fast fashion 30-40%. Premium products have lower return rates but higher per-return cost.",
+        "[20] **MDPI / Electronics** (2024). 'Predicting Product Returns in E-Commerce.' Number of products in order identified as predictive feature for return probability. Multi-item orders show elevated return rates.",
+        "[23] **Radial** (2024). 'The Psychology of Returns.' Emotionally driven sales and impulse purchases lead to higher buyer's remorse. 57% of women report impulse-buying clothing online. Discount depth correlates with return likelihood.",
+        "[24] **Opensend** (2024). 'E-Commerce Return Statistics.' Damaged items during shipping account for ~20% of returns. Transit time correlates with damage risk. 15-20% of returns attributed to buyer's remorse.",
     ]
     for r in refs:
         st.markdown(f'<div class="ref-item">{r}</div>', unsafe_allow_html=True)
