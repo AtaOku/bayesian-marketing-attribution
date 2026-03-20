@@ -608,6 +608,12 @@ with tab_diagnose:
                        "This addresses the observable independence assumption by modeling correlations "
                        "between signals via 4 customer archetypes.")
             st.caption("⚠️ First load takes ~14s — network is cached after that.")
+            st.image("assets/bn_segment_topology.png", use_container_width=True)
+            st.caption(
+                "**Segment topology:** Diamond = latent customer segment node. "
+                "Colored boxes = 4 customer archetypes. Grey boxes = observable signals & root causes. "
+                "Dashed edges = segment–signal correlations."
+            )
             if st.button("Load Segment Analysis", key="load_segment", type="secondary"):
                 st.session_state["segment_loaded"] = True
 
