@@ -12,9 +12,9 @@
 
 ## The Problem
 
-Fashion e-commerce suffers from return rates of **25-40%**, costing the industry **$218 billion globally** (Radial, 2024). Analytics dashboards show *which* items are returned — but cannot answer **why**.
+Fashion e-commerce suffers from return rates of **25–40%**, costing the industry **$218 billion globally** (Radial, 2024). Analytics dashboards show *which* items are returned — but cannot answer **why**.
 
-Customer-reported reasons are unreliable: surveys show only 30-40% completion, and customers frequently misreport the true reason. Meanwhile, the actual breakdown (Coresight, 2023; Rocket Returns, 2025):
+Customer-reported reasons are unreliable: surveys show only 30–40% completion, and customers frequently misreport the true reason. Meanwhile, the actual breakdown (Coresight, 2023; Rocket Returns, 2025):
 
 | Root Cause | Share of Returns |
 |---|---|
@@ -26,19 +26,15 @@ Customer-reported reasons are unreliable: surveys show only 30-40% completion, a
 
 ## The Solution: Backward Inference
 
-This tool uses a **Bayesian Network** to reason *backward* from observed signals to hidden causes — a form of **abductive inference** (inference to the best explanation):
+This tool uses a **Bayesian Network** to reason *backward* from observed signals to hidden causes:
 
 ```
 Given: returned = Yes + observable order signals
 Infer: P(root_cause | evidence) for 5 competing causes
-Find:  Which cause is most consistent with the observed evidence?
+Find:  Which cause has the highest diagnostic lift?
 ```
 
-**Why BN and not regression?** Regression predicts *P(returned | features)* — whether a return will happen. A BN computes *P(cause | returned=Yes, signals)* — which explanation best fits the observed pattern. Three capabilities make BN the right technique here:
-
-1. **Backward inference** — conditioning on the outcome (`returned=Yes`) to reason about causes. This backward component contributes 2-3x more diagnostic information than the forward signal-to-cause path.
-2. **Marginalization** — any combination of known/unknown signals (3¹² = 531K patterns) is handled natively. No imputation needed.
-3. **Explaining away** — when one cause explains the return (e.g., bracketing via multi-size order), competing causes are automatically downweighted. This competitive reasoning requires structured graphical models.
+**Why BN and not regression?** Regression predicts *P(returned | features)* — whether a return happens. A BN computes *P(cause | returned=Yes, signals)* — **why** it happened. This is the information merchandising teams need.
 
 ## Network Architecture
 
@@ -112,6 +108,7 @@ The **Calibration** tab provides three modes:
 
 | Mode | What You Adjust | Use Case |
 |---|---|---|
+| **Guided Setup** | Target return rate + 5 key priors → auto-calibrates | "I want the model to match our 28% return rate" |
 | **Quick Mode** | 12 observable priors + 6 Noisy-OR strengths | "Our mobile share is 78%, not 65%" |
 | **Advanced Mode** | All 24 CPT risk increments per root cause | "Size-sensitive category contributes +15%, not +12%" |
 | **CSV Import/Export** | All 42 parameters via spreadsheet | Team calibration workflow, version control |
@@ -122,10 +119,10 @@ All other tabs (Diagnosis, What-If, Methodology) update live with your custom pa
 
 | Scenario | Top Diagnosis | Lift |
 |---|---|---|
-| The Size-Blind First-Timer | 👗 Size Mismatch | 3.69x |
-| The Try-At-Home Bracketer | 🔄 Bracketing | 12.05x |
-| The Instagram Impulse Shopper | 💸 Impulse Regret | 3.62x |
-| The Frustrated Late Receiver | 📦 Quality/Fulfillment | 5.56x |
+| The Size-Blind First-Timer | 👗 Size Mismatch | 3.69× |
+| The Try-At-Home Bracketer | 🔄 Bracketing | 12.05× |
+| The Instagram Impulse Shopper | 💸 Impulse Regret | 3.62× |
+| The Frustrated Late Receiver | 📦 Quality/Fulfillment | 5.56× |
 
 ## Tech Stack
 
@@ -151,22 +148,26 @@ See the full References tab in the app for 17 citations. Key sources:
 3. Rocket Returns (2025). "Ecommerce Return Rates: Complete Industry Analysis"
 4. AfterShip (2024). "Returns: Fashion's $218 Billion Problem"
 5. Landmark Global (2025). "Wardrobing & Bracketing: Serial Returners"
-6. Russell & Norvig (2021). *AI: A Modern Approach*, 4th ed., Ch. 13-14
-
-## Part of the MarTech × AI Portfolio
-
-This is **Project 3** in a portfolio demonstrating AI techniques applied to marketing:
-
-| # | Project | AI Technique | Status |
-|---|---------|-------------|--------|
-| 1 | ContentEngine AI | LLM batch pipeline | ✅ Live |
-| 2 | CSP Campaign Planner | Constraint satisfaction | ✅ Live |
-| 3 | **Bayesian Return Diagnosis** | Bayesian Networks | ← You are here |
-| 4 | Competitor Intel Monitor | NLP + sentiment scoring | ✅ Live |
-| 5 | Journey Intelligence Engine | Markov chains + anomaly scoring | ✅ Live |
-| 6 | MDP Optimal Contact Policy | Markov Decision Process | Planned |
-| 7 | Logic Compliance Engine | Propositional/FOL logic | Planned |
+6. Russell & Norvig (2021). *AI: A Modern Approach*, 4th ed., Ch. 13–14
 
 ---
 
-*Built by Ata Okuzcuoglu · TUM MSc Management & Technology · 2026*
+## Part of the MarTech × AI Portfolio
+
+This is **Project 3** in a portfolio demonstrating classical AI techniques applied to real marketing problems:
+
+| # | Project | Technique | Status |
+|---|---|---|---|
+| 1 | [ContentEngine AI](https://contentengine-v6.vercel.app) | Structured prompt chaining | ✅ Live |
+| 2 | [CSP Campaign Planner](https://csp-campaign-planner.streamlit.app) | Constraint Satisfaction (CP-SAT) | ✅ Live |
+| **3** | **BN Return Root Cause Diagnosis** | **Bayesian Networks (Backward Inference)** | **✅ Live** |
+| 4 | [Competitor Intel Monitor](https://competitor-intel-monitor.netlify.app) | Multi-source signal pipeline + LLM | ✅ Live |
+| 5 | [Journey Intelligence Engine](https://journey-intelligence-engine.vercel.app) | First-order Markov chains + value iteration | ✅ Live |
+| 6 | MDP Optimal Contact Policy | Markov Decision Process (value iteration) | 📋 Planned |
+| 7 | Logic-Based Compliance Engine | Propositional logic + forward chaining | 📋 Planned |
+
+Portfolio & case study: [notion.so/311feccf87108167a9fac3aa5ed3f1c3](https://notion.so/311feccf87108167a9fac3aa5ed3f1c3)
+
+---
+
+*Built by Ata Okuzcuoglu · TUM MSc Management & Technology · 2025*
